@@ -1,26 +1,36 @@
-// Follow this setup guide to integrate the Deno language server with your editor:
-// https://deno.land/manual/getting_started/setup_your_environment
-// This enables autocomplete, go to definition, etc.
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.7.1'
-
-const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
-const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-const supabase = createClient(supabaseUrl, supabaseKey)
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+}
 
 Deno.serve(async (req) => {
+  // Handle CORS preflight requests
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders })
+  }
+
   try {
+    // Create Supabase client with service role key
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+    
+    const supabase = createClient(supabaseUrl, supabaseServiceKey)
+
     // Calculate the date 6 days ago
     const sixDaysAgo = new Date()
     sixDaysAgo.setDate(sixDaysAgo.getDate() - 6)
-    const sixDaysAgoStr = sixDaysAgo.toISOString()
+    const cutoffDate = sixDaysAgo.toISOString()
+
+    console.log(`Deleting reports completed before: ${cutoffDate}`)
 
     // Get completed reports older than 6 days
     const { data: reportsToDelete, error: fetchError } = await supabase
       .from('reports')
-      .select('id, pdf_url')
+      .select('id, pdf_url, user_id')
       .eq('status', 'completed')
-      .lt('updated_at', sixDaysAgoStr)
+      .lt('completed_at', cutoffDate)
 
     if (fetchError) {
       throw fetchError
@@ -28,24 +38,33 @@ Deno.serve(async (req) => {
 
     console.log(`Found ${reportsToDelete?.length || 0} reports to delete`)
 
-    // Process each report
     const results = []
+    let deletedCount = 0
+    let errorCount = 0
+
+    // Process each report
     for (const report of reportsToDelete || []) {
       try {
-        // Extract the path from the URL
-        const urlParts = report.pdf_url.split('/')
-        const bucketPath = urlParts.slice(urlParts.indexOf('reports')).join('/')
+        // Delete the PDF file from storage if it exists
+        if (report.pdf_url) {
+          // Extract the file path from the URL
+          const url = new URL(report.pdf_url)
+          const pathParts = url.pathname.split('/')
+          const bucketIndex = pathParts.indexOf('reports')
+          
+          if (bucketIndex !== -1 && bucketIndex < pathParts.length - 1) {
+            const filePath = pathParts.slice(bucketIndex + 1).join('/')
+            
+            const { error: storageError } = await supabase.storage
+              .from('reports')
+              .remove([filePath])
 
-        // Delete the file from storage
-        const { error: storageError } = await supabase
-          .storage
-          .from('reports')
-          .remove([bucketPath])
-
-        if (storageError) {
-          console.error(`Error deleting file for report ${report.id}:`, storageError)
-          results.push({ id: report.id, success: false, error: storageError.message })
-          continue
+            if (storageError) {
+              console.error(`Error deleting file for report ${report.id}:`, storageError)
+            } else {
+              console.log(`Deleted file: ${filePath}`)
+            }
+          }
         }
 
         // Delete the report record from the database
@@ -56,42 +75,72 @@ Deno.serve(async (req) => {
 
         if (deleteError) {
           console.error(`Error deleting report ${report.id}:`, deleteError)
-          results.push({ id: report.id, success: false, error: deleteError.message })
-          continue
+          errorCount++
+          results.push({ 
+            id: report.id, 
+            success: false, 
+            error: deleteError.message 
+          })
+        } else {
+          console.log(`Deleted report: ${report.id}`)
+          deletedCount++
+          results.push({ 
+            id: report.id, 
+            success: true 
+          })
         }
 
-        results.push({ id: report.id, success: true })
       } catch (err) {
         console.error(`Error processing report ${report.id}:`, err)
-        results.push({ id: report.id, success: false, error: err.message })
+        errorCount++
+        results.push({ 
+          id: report.id, 
+          success: false, 
+          error: err.message 
+        })
       }
     }
 
+    const response = {
+      success: true,
+      message: `Auto-deletion completed`,
+      stats: {
+        totalFound: reportsToDelete?.length || 0,
+        deleted: deletedCount,
+        errors: errorCount,
+        cutoffDate
+      },
+      details: results
+    }
+
+    console.log('Auto-deletion summary:', response.stats)
+
     return new Response(
-      JSON.stringify({
-        processed: reportsToDelete?.length || 0,
-        successful: results.filter(r => r.success).length,
-        failed: results.filter(r => !r.success).length,
-        details: results
-      }),
-      { headers: { 'Content-Type': 'application/json' } },
+      JSON.stringify(response),
+      { 
+        headers: { 
+          ...corsHeaders,
+          'Content-Type': 'application/json' 
+        } 
+      }
     )
+
   } catch (error) {
     console.error('Error in auto-delete function:', error)
+    
     return new Response(
-      JSON.stringify({ error: error.message }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } },
+      JSON.stringify({ 
+        success: false,
+        error: error.message,
+        message: 'Failed to execute auto-deletion'
+      }),
+      { 
+        status: 500, 
+        headers: { 
+          ...corsHeaders,
+          'Content-Type': 'application/json' 
+        } 
+      }
     )
   }
 })
-
-/* To invoke locally:
-
-1. Start Supabase locally: npx supabase start
-2. Run the function: npx supabase functions serve auto-delete-reports
-3. Invoke the function: curl -i --location --request POST 'http://localhost:54321/functions/v1/auto-delete-reports' \
-   --header 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0' \
-   --header 'Content-Type: application/json' \
-   --data '{}'
-
-*/
